@@ -1,20 +1,23 @@
 # Patientendaten (SQL + UI)
 
-Dieses Projekt bildet dein ER-Diagramm als SQL-Datenbank (SQLite) ab und liefert ein lokales Web-UI zur Verwaltung der Daten.
+Dieses Projekt bildet das ER-Diagramm als SQLite-Datenbank ab und liefert ein lokales Web-UI mit rollenbasiertem Login.
 
 ## Features
 
 - Vollständiges SQL-Schema inkl. Kern- und Zuordnungstabellen (`schema.sql`)
-- Web-UI mit folgenden Bereichen:
-  - Patientenübersicht mit anklickbaren Zeilen
-  - Ausfahrende InfoCard mit Detaildaten eines Patienten
-  - Formulare zur Verwaltung weiterer DB-Funktionen (Praxis, Arzt, Behandlung, Dokumente, Medikamente, Rezepte, Zuordnungen)
-- Privacy-Modus:
-  - Standardmäßig **aktiviert**
-  - Daten werden maskiert
-  - Entsperren per Passwort `Entsperren123!`
-  - Zustand in verschlüsseltem Cookie gespeichert
-  - Cookie läuft nach 5 Minuten ab
+- Login-Frontpage unter `/` mit **einem Eingabefeld** (Login-ID)
+- Getrennte Login-Seiten je Rolle:
+  - Patient: `/patienten/login`
+  - Praxis: `/praxis/login`
+  - Admin: `/admin/login`
+- Patienten-Erstanmeldung über `/patienten/erstlogin` mit Passwortwechsel
+- Admin-Oberfläche für:
+  - Anlage und Verwaltung medizinischer Entitäten
+  - Übersicht aller User-Logins
+  - Einsicht in simulierte Mail-Outbox
+- Praxis-Oberfläche zur Einsicht/Verwaltung eigener Patienten
+- Separate Login-Datenbank `user_logins.db`, verknüpft über `patient_id` (paID) und `praxis_id`
+- Beim Anlegen von Patient/Praxis werden temporäre Logindaten erzeugt und als E-Mail in `mail_outbox` protokolliert
 
 ## Start
 
@@ -26,4 +29,12 @@ Dann im Browser öffnen:
 
 - http://localhost:5000
 
-Beim ersten Start wird die Datei `patientendaten.db` automatisch erstellt.
+Beim ersten Start werden automatisch erstellt:
+
+- `patientendaten.db`
+- `user_logins.db`
+
+Demo-Admin-Login:
+
+- Login-ID: `admin`
+- Passwort: `Admin123!`
