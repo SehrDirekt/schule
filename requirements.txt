@@ -1,0 +1,1 @@
+# Keine externen Abhängigkeiten nötig (nur Python-Standardbibliothek)
