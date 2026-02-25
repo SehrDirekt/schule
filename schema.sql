@@ -110,12 +110,22 @@ CREATE TABLE IF NOT EXISTS zo_behandlung_dokumente (
   FOREIGN KEY (dokument_id) REFERENCES dokumente(dokument_id)
 );
 
+
+CREATE TABLE IF NOT EXISTS rezept (
+  rezept_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patient_id INTEGER NOT NULL,
+  ausstellungsdatum TEXT,
+  hinweise TEXT,
+  FOREIGN KEY (patient_id) REFERENCES patient(patient_id)
+);
+
 CREATE TABLE IF NOT EXISTS zo_medikament_rezept (
   zomr_id INTEGER PRIMARY KEY AUTOINCREMENT,
   rezept_id INTEGER NOT NULL,
   medikament_id INTEGER NOT NULL,
   anzahl INTEGER DEFAULT 1,
   zobal_id INTEGER,
+  FOREIGN KEY (rezept_id) REFERENCES rezept(rezept_id),
   FOREIGN KEY (medikament_id) REFERENCES medikament(medikament_id),
   FOREIGN KEY (zobal_id) REFERENCES zo_behandlung_arzt(zobal_id)
 );
