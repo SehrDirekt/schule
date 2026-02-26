@@ -386,10 +386,27 @@ def admin_dashboard() -> bytes:
             out.append(f"<option value='{r[idk]}'>{label}</option>")
         return "".join(out)
 
-    user_rows = "".join(
-        f"<tr><td>{u['user_id']}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['praxis_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td></tr>"
-        for u in users
-    )
+    user_row_list = []
+    for u in users:
+        login_escaped = html.escape(u["login_id"], quote=True)
+        toggle_target = "0" if u["is_active"] else "1"
+        toggle_label = "Deaktivieren" if u["is_active"] else "Aktivieren"
+        actions = (
+            f"<form method='post' action='/admin/toggle-active'>"
+            f"<input type='hidden' name='login_id' value='{login_escaped}'>"
+            f"<input type='hidden' name='is_active' value='{toggle_target}'>"
+            f"<button type='submit'>{toggle_label}</button></form>"
+        )
+        if u["role"] != "admin":
+            actions += (
+                "<form method='post' action='/admin/delete-user' onsubmit=\"return confirm(\'Account wirklich löschen?\')\">"
+                f"<input type='hidden' name='login_id' value='{login_escaped}'>"
+                "<button type='submit'>Löschen</button></form>"
+            )
+        user_row_list.append(
+            f"<tr><td>{u['user_id']}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['praxis_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td><td>{actions}</td></tr>"
+        )
+    user_rows = "".join(user_row_list)
     mail_rows = "".join(
         f"<tr><td>{html.escape(m['receiver'])}</td><td>{html.escape(m['subject'])}</td><td><pre>{html.escape(m['body'])}</pre></td><td>{m['created_at']}</td></tr>"
         for m in mails
@@ -543,7 +560,7 @@ def admin_dashboard() -> bytes:
 <section>
   <h3>User-Logins (separate DB)</h3>
   <table>
-    <thead><tr><th>UserID</th><th>Login</th><th>Rolle</th><th>paID</th><th>arztID</th><th>praxisID</th><th>menschID</th><th>Temp</th><th>Status</th><th>Erstellt</th></tr></thead>
+    <thead><tr><th>UserID</th><th>Login</th><th>Rolle</th><th>paID</th><th>arztID</th><th>praxisID</th><th>menschID</th><th>Temp</th><th>Status</th><th>Erstellt</th><th>Aktionen</th></tr></thead>
     <tbody>{user_rows}</tbody>
   </table>
 </section>
@@ -1066,6 +1083,23 @@ def accept_praxis_invite(form_data: dict[str, list[str]], session: dict) -> None
     db.commit()
     db.close()
 
+def toggle_user_active(form_data: dict[str, list[str]]) -> None:
+    login_id = get_val(form_data, "login_id")
+    target_active = 1 if get_val(form_data, "is_active") == "1" else 0
+    auth_db = get_auth_db()
+    auth_db.execute("UPDATE user_login SET is_active = ? WHERE login_id = ? AND role != 'admin'", (target_active, login_id))
+    auth_db.commit()
+    auth_db.close()
+
+
+def delete_user_account(form_data: dict[str, list[str]]) -> None:
+    login_id = get_val(form_data, "login_id")
+    auth_db = get_auth_db()
+    auth_db.execute("DELETE FROM user_login WHERE login_id = ? AND role != 'admin'", (login_id,))
+    auth_db.commit()
+    auth_db.close()
+
+
 def update_behandlung(form_data: dict[str, list[str]]) -> None:
     db = get_db()
     db.execute(
@@ -1117,6 +1151,8 @@ def route_login_start(environ, start_response):
         return redirect(start_response, f"/patienten/login?login_id={login_id}")
     if user["role"] == "arzt":
         return redirect(start_response, f"/arzt/login?login_id={login_id}")
+    if user["role"] == "praxis":
+        return redirect(start_response, f"/praxis/login?login_id={login_id}")
     return redirect(start_response, f"/admin/login?login_id={login_id}")
 
 
@@ -1336,6 +1372,8 @@ def app(environ, start_response):
         "/mapping/praxis-patient": create_mapping_praxis_patient,
         "/mapping/behandlung-arzt": create_mapping_behandlung_arzt,
         "/admin/reset-password": reset_user_password,
+        "/admin/toggle-active": toggle_user_active,
+        "/admin/delete-user": delete_user_account,
     }
 
     if path in admin_handlers and method == "POST":
