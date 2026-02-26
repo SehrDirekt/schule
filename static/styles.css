@@ -79,3 +79,9 @@ th, td { border-bottom: 1px solid var(--border); padding: .58rem; text-align: le
 th { color: var(--muted); font-weight: 600; }
 
 pre { margin: 0; white-space: pre-wrap; }
+
+.overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .8rem; margin-top: .8rem; }
+.summary-card { background: var(--panel-light); border: 1px solid var(--border); border-radius: 12px; padding: .8rem; }
+.summary-card h4 { margin: 0; color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
+.summary-card p { margin: .4rem 0 0; font-size: 1.6rem; font-weight: 700; }
+.quick-links { margin: .4rem 0 0; padding-left: 1rem; display: grid; gap: .35rem; }

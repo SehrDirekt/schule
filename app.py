@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
@@ -18,6 +19,24 @@ SCHEMA_PATH = BASE_DIR / "schema.sql"
 COOKIE_NAME = "app_session"
 APP_SECRET = os.environ.get("APP_SECRET", "schule-local-secret-change-me").encode("utf-8")
 SESSION_TTL_SECONDS = 60 * 60 * 8
+
+
+@dataclass(frozen=True)
+class LdapConfig:
+    enabled: bool
+    server_uri: str
+    bind_dn_template: str
+    search_base: str
+
+
+def ldap_config() -> LdapConfig:
+    enabled = os.environ.get("LDAP_ENABLED", "0") == "1"
+    return LdapConfig(
+        enabled=enabled,
+        server_uri=os.environ.get("LDAP_SERVER_URI", "ldap://localhost:389"),
+        bind_dn_template=os.environ.get("LDAP_BIND_DN_TEMPLATE", "uid={login_id},ou=people,dc=schule,dc=local"),
+        search_base=os.environ.get("LDAP_SEARCH_BASE", "ou=people,dc=schule,dc=local"),
+    )
 
 
 def get_db() -> sqlite3.Connection:
@@ -157,6 +176,24 @@ def verify_password(password: str, pw_hash: str, salt_hex: str) -> bool:
     return hmac.compare_digest(digest, pw_hash)
 
 
+def verify_ldap_password(login_id: str, password: str) -> bool:
+    cfg = ldap_config()
+    if not cfg.enabled or not password:
+        return False
+    import importlib.util
+
+    if importlib.util.find_spec("ldap3") is None:
+        return False
+    ldap3 = __import__("ldap3")
+    user_dn = cfg.bind_dn_template.format(login_id=login_id)
+    server = ldap3.Server(cfg.server_uri, get_info=ldap3.NONE)
+    connection = ldap3.Connection(server, user=user_dn, password=password, auto_bind=False)
+    if not connection.bind():
+        return False
+    connection.unbind()
+    return True
+
+
 def build_session_cookie(payload: dict) -> str:
     exp = int(time.time()) + SESSION_TTL_SECONDS
     payload = payload | {"exp": exp}
@@ -274,7 +311,7 @@ def login_frontpage(error: str = "") -> bytes:
         f"""
 <section class='narrow'>
   <h2>Login starten</h2>
-  <p>Bitte geben Sie Ihre Login-ID ein. Danach werden Sie zur passenden Login-Seite weitergeleitet.</p>
+  <p>Bitte geben Sie Ihre Login-ID ein. Danach werden Sie zur passenden Anmeldeseite weitergeleitet.</p>
   {error_html}
   <form method='post' action='/login/start'>
     <label>Login-ID
@@ -285,7 +322,7 @@ def login_frontpage(error: str = "") -> bytes:
 </section>
 """,
         title="Patientendaten Portal",
-        subtitle="Einstieg über eine zentrale Login-Frontpage",
+        subtitle="Einstieg über eine zentrale Login-Startseite",
     )
 
 
@@ -295,8 +332,9 @@ def role_login_page(role: str, login_id: str, error: str = "") -> bytes:
     return base_layout(
         f"""
 <section class='narrow'>
-  <h2>{roles[role]}-Login</h2>
+  <h2>{roles[role]}-Anmeldung</h2>
   {error_html}
+  {"<p class='subtitle'>Admins können sich lokal oder via LDAP anmelden.</p>" if role == 'admin' else ''}
   <form method='post' action='/{role}/authenticate'>
     <label>Login-ID
       <input name='login_id' value='{html.escape(login_id, quote=True)}' readonly>
@@ -306,10 +344,10 @@ def role_login_page(role: str, login_id: str, error: str = "") -> bytes:
     </label>
     <button type='submit'>Anmelden</button>
   </form>
-  <p><a href='/'>Zurück zur Frontpage</a></p>
+  <p><a href='/'>Zurück zur Startseite</a></p>
 </section>
 """,
-        title=f"{roles[role]} Login",
+        title=f"{roles[role]} Anmeldung",
     )
 
 
@@ -386,6 +424,19 @@ def admin_dashboard() -> bytes:
             out.append(f"<option value='{r[idk]}'>{label}</option>")
         return "".join(out)
 
+    stats = {
+        "Gesamt-Logins": len(users),
+        "Praxen": len(praxen),
+        "Ärzte": len(aerzte),
+        "Patienten": len(patienten),
+    }
+    stat_cards = "".join(f"<article class='summary-card'><h4>{k}</h4><p>{v}</p></article>" for k, v in stats.items())
+
+    praxis_shortcuts = "".join(
+        f"<li><a href='/admin/praxis-dashboard?praxis_id={p['praxis_id']}'>Praxis {p['praxis_id']}: {html.escape(p['name'])}</a></li>"
+        for p in praxen
+    ) or "<li>Keine Praxis vorhanden.</li>"
+
     user_row_list = []
     for u in users:
         login_escaped = html.escape(u["login_id"], quote=True)
@@ -412,13 +463,35 @@ def admin_dashboard() -> bytes:
         for m in mails
     )
 
+    ldap_hint = "aktiv" if ldap_config().enabled else "deaktiviert"
+
     content = f"""
 <section>
-  <h2>Admin-Oberfläche</h2>
+  <h2>Admin Control Center</h2>
+  <p class='subtitle'>Benennungen wurden vereinheitlicht, Bereiche sind nach Aufgaben gruppiert.</p>
   <p><a href='/logout'>Abmelden</a></p>
+  <div class='overview-grid'>{stat_cards}</div>
+</section>
+<section>
+  <h3>Überblick & Schnellzugriff</h3>
   <div class='cards'>
     <article>
-      <h3>Praxis anlegen</h3>
+      <h4>Praxis-Dashboards öffnen</h4>
+      <p>Admins können direkt in Praxis-Dashboards springen.</p>
+      <ul class='quick-links'>{praxis_shortcuts}</ul>
+    </article>
+    <article>
+      <h4>LDAP Status</h4>
+      <p>LDAP-Anmeldung für Admins ist aktuell: <strong>{ldap_hint}</strong>.</p>
+      <p class='subtitle'>Konfiguration via LDAP_ENABLED, LDAP_SERVER_URI, LDAP_BIND_DN_TEMPLATE.</p>
+    </article>
+  </div>
+</section>
+<section>
+  <h3>Stammdaten anlegen</h3>
+  <div class='cards'>
+    <article>
+      <h4>Praxis anlegen</h4>
       <form method='post' action='/praxis/new' class='form-grid'>
         <label>Praxisname <input name='name' required></label>
         <label>Straße + Hausnr. <input name='strasse' required></label>
@@ -429,9 +502,8 @@ def admin_dashboard() -> bytes:
         <button type='submit'>Praxis speichern</button>
       </form>
     </article>
-
     <article>
-      <h3>Patient anlegen (inkl. Login-Mail)</h3>
+      <h4>Patient anlegen (inkl. Login-Mail)</h4>
       <form method='post' action='/patient/new' class='form-grid'>
         <label>Name <input name='name' required></label>
         <label>Geburtsdatum <input type='date' name='geburtsdatum'></label>
@@ -448,9 +520,8 @@ def admin_dashboard() -> bytes:
         <button type='submit'>Patient speichern</button>
       </form>
     </article>
-
     <article>
-      <h3>Arzt anlegen</h3>
+      <h4>Arzt anlegen</h4>
       <form method='post' action='/arzt/new' class='form-grid'>
         <label>Name <input name='name' required></label>
         <label>Fachrichtung <input name='fachrichtung'></label>
@@ -462,103 +533,35 @@ def admin_dashboard() -> bytes:
         <button type='submit'>Arzt speichern</button>
       </form>
     </article>
-
-    <article>
-      <h3>Behandlung anlegen</h3>
-      <form method='post' action='/behandlung/new' class='form-grid'>
-        <label>Patient-ID <select name='patient_id' required>{options(patienten, 'patient_id')}</select></label>
-        <label>Fachrichtung <input name='fachrichtung'></label>
-        <label>Dauer <input name='behandlungsdauer'></label>
-        <label>Datum <input type='date' name='datum'></label>
-        <button type='submit'>Behandlung speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Rezept anlegen</h3>
-      <form method='post' action='/rezept/new' class='form-grid'>
-        <label>Patient-ID <select name='patient_id'>{options(patienten, 'patient_id')}</select></label>
-        <label>Medikament <select name='medikament_id'>{options(medikamente, 'medikament_id', 'name')}</select></label>
-        <label>Anzahl <input type='number' name='anzahl' value='1' min='1'></label>
-        <label>zobal-ID (Behandlung-Arzt) <select name='zobal_id' required>{options(zobals, 'zobal_id')}</select></label>
-        <label>Hinweise <input name='hinweise'></label>
-        <button type='submit'>Rezept speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Medikament anlegen</h3>
-      <form method='post' action='/medikament/new' class='form-grid'>
-        <label>Name <input name='name' required></label>
-        <label>Wirkstoff <input name='wirkstoff'></label>
-        <label>Hersteller <input name='hersteller'></label>
-        <button type='submit'>Speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Dokument anlegen</h3>
-      <form method='post' action='/dokument/new' class='form-grid'>
-        <label>Dateipfad <input name='pfad'></label>
-        <label>Dokumentname <input name='dokumentname'></label>
-        <label>Author <input name='author'></label>
-        <button type='submit'>Speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Zuordnung Praxis ↔ Arzt</h3>
-      <form method='post' action='/mapping/praxis-arzt' class='form-grid'>
-        <label>Arzt-ID <select name='arzt_id'>{options(aerzte, 'arzt_id')}</select></label>
-        <label>Praxis-ID <select name='praxis_id'>{options(praxen, 'praxis_id', 'name')}</select></label>
-        <label>Beschäftigungsstart <input type='date' name='beschaeftigungsstart'></label>
-        <button type='submit'>Zuordnung speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Zuordnung Behandlung ↔ Dokument</h3>
-      <form method='post' action='/mapping/behandlung-dokument' class='form-grid'>
-        <label>Behandlung-ID <select name='behandlung_id'>{options(behandlungen, 'behandlung_id')}</select></label>
-        <label>Dokument <select name='dokument_id'>{options(dokumente, 'dokument_id', 'dokumentname')}</select></label>
-        <button type='submit'>Zuordnung speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Zuordnung Praxis ↔ Patient (Diagramm)</h3>
-      <form method='post' action='/mapping/praxis-patient' class='form-grid'>
-        <label>Praxis-ID <select name='praxis_id'>{options(praxen, 'praxis_id', 'name')}</select></label>
-        <label>Patient-ID <select name='patient_id'>{options(patienten, 'patient_id')}</select></label>
-        <label>Erstbesuch <input type='date' name='erstbesuch'></label>
-        <button type='submit'>Zuordnung speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Zuordnung Behandlung ↔ Arzt (Diagramm)</h3>
-      <form method='post' action='/mapping/behandlung-arzt' class='form-grid'>
-        <label>Behandlung-ID <select name='behandlung_id'>{options(behandlungen, 'behandlung_id')}</select></label>
-        <label>Arzt-ID <select name='arzt_id'>{options(aerzte, 'arzt_id')}</select></label>
-        <button type='submit'>Zuordnung speichern</button>
-      </form>
-    </article>
-
-    <article>
-      <h3>Passwort zurücksetzen</h3>
-      <form method='post' action='/admin/reset-password' class='form-grid'>
-        <label>Login-ID <input name='login_id' required placeholder='z. B. arzt-1'></label>
-        <label>Neues Passwort <input type='password' name='new_password' required minlength='8'></label>
-        <label>Als temporär markieren
-          <select name='is_temp_password'><option value='1'>Ja</option><option value='0'>Nein</option></select>
-        </label>
-        <button type='submit'>Passwort zurücksetzen</button>
-      </form>
-    </article>
   </div>
 </section>
 <section>
-  <h3>User-Logins (separate DB)</h3>
+  <h3>Behandlung & Zuordnungen</h3>
+  <div class='cards'>
+    <article><h4>Behandlung anlegen</h4><form method='post' action='/behandlung/new' class='form-grid'><label>Patient-ID <select name='patient_id' required>{options(patienten, 'patient_id')}</select></label><label>Fachrichtung <input name='fachrichtung'></label><label>Dauer <input name='behandlungsdauer'></label><label>Datum <input type='date' name='datum'></label><button type='submit'>Behandlung speichern</button></form></article>
+    <article><h4>Rezept anlegen</h4><form method='post' action='/rezept/new' class='form-grid'><label>Patient-ID <select name='patient_id'>{options(patienten, 'patient_id')}</select></label><label>Medikament <select name='medikament_id'>{options(medikamente, 'medikament_id', 'name')}</select></label><label>Anzahl <input type='number' name='anzahl' value='1' min='1'></label><label>zobal-ID <select name='zobal_id' required>{options(zobals, 'zobal_id')}</select></label><label>Hinweise <input name='hinweise'></label><button type='submit'>Rezept speichern</button></form></article>
+    <article><h4>Medikament anlegen</h4><form method='post' action='/medikament/new' class='form-grid'><label>Name <input name='name' required></label><label>Wirkstoff <input name='wirkstoff'></label><label>Hersteller <input name='hersteller'></label><button type='submit'>Speichern</button></form></article>
+    <article><h4>Dokument anlegen</h4><form method='post' action='/dokument/new' class='form-grid'><label>Dateipfad <input name='pfad'></label><label>Dokumentname <input name='dokumentname'></label><label>Author <input name='author'></label><button type='submit'>Speichern</button></form></article>
+    <article><h4>Zuordnung Praxis ↔ Arzt</h4><form method='post' action='/mapping/praxis-arzt' class='form-grid'><label>Arzt-ID <select name='arzt_id'>{options(aerzte, 'arzt_id')}</select></label><label>Praxis-ID <select name='praxis_id'>{options(praxen, 'praxis_id', 'name')}</select></label><label>Beschäftigungsstart <input type='date' name='beschaeftigungsstart'></label><button type='submit'>Zuordnung speichern</button></form></article>
+    <article><h4>Zuordnung Praxis ↔ Patient</h4><form method='post' action='/mapping/praxis-patient' class='form-grid'><label>Praxis-ID <select name='praxis_id'>{options(praxen, 'praxis_id', 'name')}</select></label><label>Patient-ID <select name='patient_id'>{options(patienten, 'patient_id')}</select></label><label>Erstbesuch <input type='date' name='erstbesuch'></label><button type='submit'>Zuordnung speichern</button></form></article>
+    <article><h4>Zuordnung Behandlung ↔ Arzt</h4><form method='post' action='/mapping/behandlung-arzt' class='form-grid'><label>Behandlung-ID <select name='behandlung_id'>{options(behandlungen, 'behandlung_id')}</select></label><label>Arzt-ID <select name='arzt_id'>{options(aerzte, 'arzt_id')}</select></label><button type='submit'>Zuordnung speichern</button></form></article>
+    <article><h4>Zuordnung Behandlung ↔ Dokument</h4><form method='post' action='/mapping/behandlung-dokument' class='form-grid'><label>Behandlung-ID <select name='behandlung_id'>{options(behandlungen, 'behandlung_id')}</select></label><label>Dokument <select name='dokument_id'>{options(dokumente, 'dokument_id', 'dokumentname')}</select></label><button type='submit'>Zuordnung speichern</button></form></article>
+  </div>
+</section>
+<section>
+  <h3>Kontenverwaltung</h3>
+  <article>
+    <h4>Passwort zurücksetzen</h4>
+    <form method='post' action='/admin/reset-password' class='form-grid'>
+      <label>Login-ID <input name='login_id' required placeholder='z. B. arzt-1'></label>
+      <label>Neues Passwort <input type='password' name='new_password' required minlength='8'></label>
+      <label>Als temporär markieren
+        <select name='is_temp_password'><option value='1'>Ja</option><option value='0'>Nein</option></select>
+      </label>
+      <button type='submit'>Passwort zurücksetzen</button>
+    </form>
+  </article>
+  <h4>User-Logins</h4>
   <table>
     <thead><tr><th>UserID</th><th>Login</th><th>Rolle</th><th>paID</th><th>arztID</th><th>praxisID</th><th>menschID</th><th>Temp</th><th>Status</th><th>Erstellt</th><th>Aktionen</th></tr></thead>
     <tbody>{user_rows}</tbody>
@@ -572,7 +575,7 @@ def admin_dashboard() -> bytes:
   </table>
 </section>
 """
-    return base_layout(content, title="Admin Verwaltung")
+    return base_layout(content, title="Admin Control Center")
 
 
 def arzt_dashboard(session: dict) -> bytes:
@@ -727,8 +730,8 @@ def arzt_dashboard(session: dict) -> bytes:
     )
 
 
-def praxis_dashboard(session: dict) -> bytes:
-    praxis_id = session.get("praxis_id")
+def praxis_dashboard(session: dict, override_praxis_id: int | None = None, readonly: bool = False) -> bytes:
+    praxis_id = override_praxis_id if override_praxis_id is not None else session.get("praxis_id")
     db = get_db()
     praxis = db.execute("SELECT praxis_id, name FROM praxis WHERE praxis_id = ?", (praxis_id,)).fetchone()
     aerzte = db.execute(
@@ -763,12 +766,11 @@ def praxis_dashboard(session: dict) -> bytes:
         for i in invites
     )
 
-    return base_layout(
-        f"""
-<section>
-  <h2>Praxisbereich: {html.escape(praxis['name'])}</h2>
-  <p><a href='/logout'>Abmelden</a></p>
-</section>
+    admin_back_link = " | <a href='/admin'>Zurück zum Admin Control Center</a>" if readonly else ""
+    readonly_hint = "<p class='subtitle'>Sie sehen das Praxis-Dashboard als Admin im Lesemodus.</p>" if readonly else ""
+    invite_section = ""
+    if not readonly:
+        invite_section = """
 <section>
   <h3>Arzt einladen</h3>
   <form method='post' action='/praxis/invite' class='form-grid'>
@@ -777,6 +779,16 @@ def praxis_dashboard(session: dict) -> bytes:
     <button type='submit'>Einladung senden</button>
   </form>
 </section>
+"""
+
+    return base_layout(
+        f"""
+<section>
+  <h2>Praxis Dashboard: {html.escape(praxis['name'])}</h2>
+  <p><a href='/logout'>Abmelden</a>{admin_back_link}</p>
+  {readonly_hint}
+</section>
+{invite_section}
 <section>
   <h3>Mitglieder</h3>
   <table><thead><tr><th>Arzt-ID</th><th>Name</th><th>Fachrichtung</th></tr></thead><tbody>{arzt_rows}</tbody></table>
@@ -1168,7 +1180,10 @@ def authenticate(role: str, environ, start_response):
     ).fetchone()
     db.close()
 
-    if not user or not verify_password(password, user["password_hash"], user["salt"]):
+    ldap_ok = role == "admin" and verify_ldap_password(login_id, password)
+    local_ok = bool(user and verify_password(password, user["password_hash"], user["salt"]))
+
+    if not user or (not local_ok and not ldap_ok):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [role_login_page(role, login_id, "Ungültige Login-Daten")]
 
@@ -1309,6 +1324,16 @@ def app(environ, start_response):
             return denied
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [admin_dashboard()]
+
+    if path == "/admin/praxis-dashboard" and method == "GET":
+        denied = require_role(session, "admin", start_response)
+        if denied:
+            return denied
+        praxis_id_raw = query.get("praxis_id", [""])[0]
+        if not praxis_id_raw.isdigit():
+            return redirect(start_response, "/admin")
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [praxis_dashboard(session, override_praxis_id=int(praxis_id_raw), readonly=True)]
 
     if path == "/arzt" and method == "GET":
         denied = require_role(session, "arzt", start_response)
