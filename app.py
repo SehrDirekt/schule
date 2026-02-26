@@ -48,12 +48,13 @@ def init_auth_db() -> None:
         CREATE TABLE IF NOT EXISTS user_login (
           user_id INTEGER PRIMARY KEY AUTOINCREMENT,
           login_id TEXT NOT NULL UNIQUE,
-          role TEXT NOT NULL CHECK(role IN ('admin', 'arzt', 'patient')),
+          role TEXT NOT NULL CHECK(role IN ('admin', 'arzt', 'patient', 'praxis')),
           password_hash TEXT NOT NULL,
           salt TEXT NOT NULL,
           is_temp_password INTEGER NOT NULL DEFAULT 1,
           patient_id INTEGER,
           arzt_id INTEGER,
+          praxis_id INTEGER,
           mensch_id INTEGER,
           is_active INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -66,12 +67,25 @@ def init_auth_db() -> None:
           body TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS praxis_invitation (
+          invitation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          praxis_id INTEGER NOT NULL,
+          arzt_id INTEGER NOT NULL,
+          invited_by_login TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'declined')),
+          note TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          accepted_at TEXT
+        );
         """
     )
 
     columns = [row[1] for row in db.execute("PRAGMA table_info(user_login)").fetchall()]
     if "arzt_id" not in columns:
         db.execute("ALTER TABLE user_login ADD COLUMN arzt_id INTEGER")
+    if "praxis_id" not in columns:
+        db.execute("ALTER TABLE user_login ADD COLUMN praxis_id INTEGER")
     if "mensch_id" not in columns:
         db.execute("ALTER TABLE user_login ADD COLUMN mensch_id INTEGER")
     if "praxis_id" in columns and "arzt_id" in columns:
@@ -196,16 +210,17 @@ def create_login_user(
     is_temp: bool = True,
     patient_id: int | None = None,
     arzt_id: int | None = None,
+    praxis_id: int | None = None,
     mensch_id: int | None = None,
     user_id: int | None = None,
 ) -> None:
     pw_hash, salt = password_hash(raw_password)
     db.execute(
         """
-        INSERT INTO user_login (user_id, login_id, role, password_hash, salt, is_temp_password, patient_id, arzt_id, mensch_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO user_login (user_id, login_id, role, password_hash, salt, is_temp_password, patient_id, arzt_id, praxis_id, mensch_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, login_id, role, pw_hash, salt, 1 if is_temp else 0, patient_id, arzt_id, mensch_id),
+        (user_id, login_id, role, pw_hash, salt, 1 if is_temp else 0, patient_id, arzt_id, praxis_id, mensch_id),
     )
 
 
@@ -217,7 +232,19 @@ def queue_mail(receiver: str, subject: str, body: str) -> None:
 
 
 def ensure_praxis_login(praxis_id: int) -> None:
-    return None
+    auth_db = get_auth_db()
+    login_id = f"praxis-{praxis_id}"
+    existing = auth_db.execute("SELECT 1 FROM user_login WHERE login_id = ?", (login_id,)).fetchone()
+    if not existing:
+        temp_password = secrets.token_urlsafe(8)
+        create_login_user(auth_db, login_id=login_id, role="praxis", raw_password=temp_password, praxis_id=praxis_id, user_id=100000 + praxis_id)
+        auth_db.commit()
+        queue_mail(
+            f"praxis-{praxis_id}@example.local",
+            "Praxis Login",
+            f"Login: {login_id}\nTemporäres Passwort: {temp_password}\nBitte beim ersten Login Passwort ändern.",
+        )
+    auth_db.close()
 
 
 def base_layout(content: str, title: str = "Patientendaten", subtitle: str = "") -> bytes:
@@ -263,7 +290,7 @@ def login_frontpage(error: str = "") -> bytes:
 
 
 def role_login_page(role: str, login_id: str, error: str = "") -> bytes:
-    roles = {"patient": "Patient", "arzt": "Arzt", "admin": "Admin"}
+    roles = {"patient": "Patient", "arzt": "Arzt", "admin": "Admin", "praxis": "Praxis"}
     error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
     return base_layout(
         f"""
@@ -307,10 +334,32 @@ def patient_first_login_page(login_id: str, error: str = "") -> bytes:
     )
 
 
+
+
+def praxis_first_login_page(login_id: str, error: str = "") -> bytes:
+    error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
+    return base_layout(
+        f"""
+<section class='narrow'>
+  <h2>Erstanmeldung Praxis</h2>
+  <p>Bitte ändern Sie Ihr temporäres Passwort.</p>
+  {error_html}
+  <form method='post' action='/praxis/erstlogin'>
+    <input type='hidden' name='login_id' value='{html.escape(login_id, quote=True)}'>
+    <label>Neues Passwort
+      <input type='password' name='new_password' required minlength='8'>
+    </label>
+    <button type='submit'>Passwort setzen</button>
+  </form>
+</section>
+""",
+        title="Praxis Erstanmeldung",
+    )
+
 def admin_dashboard() -> bytes:
     auth_db = get_auth_db()
     users = auth_db.execute(
-        "SELECT user_id, login_id, role, patient_id, arzt_id, mensch_id, is_temp_password, is_active, created_at FROM user_login ORDER BY user_id DESC"
+        "SELECT user_id, login_id, role, patient_id, arzt_id, praxis_id, mensch_id, is_temp_password, is_active, created_at FROM user_login ORDER BY user_id DESC"
     ).fetchall()
     mails = auth_db.execute(
         "SELECT receiver, subject, body, created_at FROM mail_outbox ORDER BY mail_id DESC LIMIT 10"
@@ -338,7 +387,7 @@ def admin_dashboard() -> bytes:
         return "".join(out)
 
     user_rows = "".join(
-        f"<tr><td>{u['user_id']}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td></tr>"
+        f"<tr><td>{u['user_id']}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['praxis_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td></tr>"
         for u in users
     )
     mail_rows = "".join(
@@ -477,12 +526,24 @@ def admin_dashboard() -> bytes:
         <button type='submit'>Zuordnung speichern</button>
       </form>
     </article>
+
+    <article>
+      <h3>Passwort zurücksetzen</h3>
+      <form method='post' action='/admin/reset-password' class='form-grid'>
+        <label>Login-ID <input name='login_id' required placeholder='z. B. arzt-1'></label>
+        <label>Neues Passwort <input type='password' name='new_password' required minlength='8'></label>
+        <label>Als temporär markieren
+          <select name='is_temp_password'><option value='1'>Ja</option><option value='0'>Nein</option></select>
+        </label>
+        <button type='submit'>Passwort zurücksetzen</button>
+      </form>
+    </article>
   </div>
 </section>
 <section>
   <h3>User-Logins (separate DB)</h3>
   <table>
-    <thead><tr><th>UserID</th><th>Login</th><th>Rolle</th><th>paID</th><th>arztID</th><th>menschID</th><th>Temp</th><th>Status</th><th>Erstellt</th></tr></thead>
+    <thead><tr><th>UserID</th><th>Login</th><th>Rolle</th><th>paID</th><th>arztID</th><th>praxisID</th><th>menschID</th><th>Temp</th><th>Status</th><th>Erstellt</th></tr></thead>
     <tbody>{user_rows}</tbody>
   </table>
 </section>
@@ -535,6 +596,10 @@ def arzt_dashboard(session: dict) -> bytes:
     ).fetchall()
     db.close()
 
+    auth_db = get_auth_db()
+    invites = auth_db.execute("SELECT invitation_id, praxis_id, status, created_at FROM praxis_invitation WHERE arzt_id = ? ORDER BY invitation_id DESC", (arzt_id,)).fetchall()
+    auth_db.close()
+
     if not arzt:
         return base_layout("<section><p>Arzt nicht gefunden.</p></section>", title="Arztbereich")
 
@@ -550,6 +615,19 @@ def arzt_dashboard(session: dict) -> bytes:
         f"<option value='{b['zobal_id']}'>{b['zobal_id']} · Beh {b['behandlung_id']} · pa-{b['patient_id']}</option>" for b in behandlungen
     )
     med_options = "".join(f"<option value='{m['medikament_id']}'>{m['medikament_id']} - {html.escape(m['name'])}</option>" for m in medikamente)
+    invite_rows_list = []
+    for i in invites:
+        action = '-'
+        if i['status'] == 'pending':
+            action = (
+                "<form method='post' action='/arzt/invite/accept'>"
+                f"<input type='hidden' name='invitation_id' value='{i['invitation_id']}'>"
+                "<button type='submit'>Annehmen</button></form>"
+            )
+        invite_rows_list.append(
+            f"<tr><td>{i['invitation_id']}</td><td>{i['praxis_id']}</td><td>{html.escape(i['status'])}</td><td>{i['created_at']}</td><td>{action}</td></tr>"
+        )
+    invite_rows = ''.join(invite_rows_list)
 
     return base_layout(
         f"""
@@ -565,6 +643,15 @@ def arzt_dashboard(session: dict) -> bytes:
     <tbody>{behandlung_rows}</tbody>
   </table>
 </section>
+
+<section>
+  <h3>Einladungen von Praxen</h3>
+  <table>
+    <thead><tr><th>ID</th><th>Praxis-ID</th><th>Status</th><th>Erstellt</th><th>Aktion</th></tr></thead>
+    <tbody>{invite_rows}</tbody>
+  </table>
+</section>
+
 <section>
   <h3>Rezept anlegen (mit Verknüpfung Behandlung ↔ Arzt)</h3>
   <form method='post' action='/arzt/rezept/new' class='form-grid'>
@@ -620,6 +707,69 @@ def arzt_dashboard(session: dict) -> bytes:
 </section>
 """,
         title="Arzt Dashboard",
+    )
+
+
+def praxis_dashboard(session: dict) -> bytes:
+    praxis_id = session.get("praxis_id")
+    db = get_db()
+    praxis = db.execute("SELECT praxis_id, name FROM praxis WHERE praxis_id = ?", (praxis_id,)).fetchone()
+    aerzte = db.execute(
+        """
+        SELECT a.arzt_id, m.vor_nachname, a.fachrichtung
+        FROM zo_praxis_arzt zpa
+        JOIN arzt a ON a.arzt_id = zpa.arzt_id
+        JOIN mensch m ON m.mensch_id = a.mensch_id
+        WHERE zpa.praxis_id = ?
+        ORDER BY m.vor_nachname ASC
+        """,
+        (praxis_id,),
+    ).fetchall()
+    db.close()
+
+    auth_db = get_auth_db()
+    invites = auth_db.execute(
+        "SELECT invitation_id, arzt_id, status, note, created_at FROM praxis_invitation WHERE praxis_id = ? ORDER BY invitation_id DESC",
+        (praxis_id,),
+    ).fetchall()
+    auth_db.close()
+
+    if not praxis:
+        return base_layout("<section><p>Praxis nicht gefunden.</p></section>", title="Praxisbereich")
+
+    arzt_rows = "".join(
+        f"<tr><td>{a['arzt_id']}</td><td>{html.escape(a['vor_nachname'])}</td><td>{html.escape(a['fachrichtung'] or '-')}</td></tr>"
+        for a in aerzte
+    )
+    invite_rows = "".join(
+        f"<tr><td>{i['invitation_id']}</td><td>{i['arzt_id']}</td><td>{html.escape(i['status'])}</td><td>{html.escape(i['note'] or '-')}</td><td>{i['created_at']}</td></tr>"
+        for i in invites
+    )
+
+    return base_layout(
+        f"""
+<section>
+  <h2>Praxisbereich: {html.escape(praxis['name'])}</h2>
+  <p><a href='/logout'>Abmelden</a></p>
+</section>
+<section>
+  <h3>Arzt einladen</h3>
+  <form method='post' action='/praxis/invite' class='form-grid'>
+    <label>Arzt Login-ID (z.B. arzt-2) <input name='arzt_login_id' required></label>
+    <label>Notiz <input name='note' placeholder='Optional'></label>
+    <button type='submit'>Einladung senden</button>
+  </form>
+</section>
+<section>
+  <h3>Mitglieder</h3>
+  <table><thead><tr><th>Arzt-ID</th><th>Name</th><th>Fachrichtung</th></tr></thead><tbody>{arzt_rows}</tbody></table>
+</section>
+<section>
+  <h3>Gesendete Einladungen</h3>
+  <table><thead><tr><th>ID</th><th>Arzt-ID</th><th>Status</th><th>Notiz</th><th>Erstellt</th></tr></thead><tbody>{invite_rows}</tbody></table>
+</section>
+""",
+        title="Praxis Dashboard",
     )
 
 
@@ -734,8 +884,10 @@ def create_praxis(form_data: dict[str, list[str]]) -> None:
     )
     kontakt_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     db.execute("INSERT INTO praxis (name, kontakt_id) VALUES (?, ?)", (get_val(form_data, "name"), kontakt_id))
+    praxis_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     db.commit()
     db.close()
+    ensure_praxis_login(praxis_id)
 
 
 def create_arzt(form_data: dict[str, list[str]]) -> None:
@@ -850,6 +1002,70 @@ def create_mapping_behandlung_arzt(form_data: dict[str, list[str]]) -> None:
 
 
 
+
+
+def reset_user_password(form_data: dict[str, list[str]]) -> None:
+    login_id = get_val(form_data, "login_id")
+    new_password = get_val(form_data, "new_password")
+    is_temp = 1 if get_val(form_data, "is_temp_password") != "0" else 0
+    if len(new_password) < 8:
+        return
+    pw_hash, salt = password_hash(new_password)
+    auth_db = get_auth_db()
+    auth_db.execute(
+        "UPDATE user_login SET password_hash = ?, salt = ?, is_temp_password = ? WHERE login_id = ?",
+        (pw_hash, salt, is_temp, login_id),
+    )
+    auth_db.commit()
+    auth_db.close()
+
+
+def invite_arzt_to_praxis(form_data: dict[str, list[str]], session: dict) -> None:
+    arzt_login_id = get_val(form_data, "arzt_login_id")
+    note = get_val(form_data, "note")
+    auth_db = get_auth_db()
+    arzt_user = auth_db.execute(
+        "SELECT arzt_id FROM user_login WHERE login_id = ? AND role = 'arzt' AND is_active = 1",
+        (arzt_login_id,),
+    ).fetchone()
+    if not arzt_user:
+        auth_db.close()
+        return
+    auth_db.execute(
+        "INSERT INTO praxis_invitation (praxis_id, arzt_id, invited_by_login, note) VALUES (?, ?, ?, ?)",
+        (int(session.get("praxis_id")), int(arzt_user["arzt_id"]), session.get("login_id", ""), note),
+    )
+    auth_db.commit()
+    auth_db.close()
+    queue_mail(arzt_login_id, "Einladung in Praxis", f"Sie wurden in die Praxis {session.get('praxis_id')} eingeladen.")
+
+
+def accept_praxis_invite(form_data: dict[str, list[str]], session: dict) -> None:
+    invitation_id = int(get_val(form_data, "invitation_id"))
+    arzt_id = int(session.get("arzt_id"))
+    auth_db = get_auth_db()
+    invite = auth_db.execute(
+        "SELECT praxis_id FROM praxis_invitation WHERE invitation_id = ? AND arzt_id = ? AND status = 'pending'",
+        (invitation_id, arzt_id),
+    ).fetchone()
+    if not invite:
+        auth_db.close()
+        return
+    auth_db.execute(
+        "UPDATE praxis_invitation SET status = 'accepted', accepted_at = CURRENT_TIMESTAMP WHERE invitation_id = ?",
+        (invitation_id,),
+    )
+    auth_db.commit()
+    auth_db.close()
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO zo_praxis_arzt (arzt_id, praxis_id, beschaeftigungsstart) VALUES (?, ?, date('now'))",
+        (arzt_id, int(invite["praxis_id"])),
+    )
+    db.commit()
+    db.close()
+
 def update_behandlung(form_data: dict[str, list[str]]) -> None:
     db = get_db()
     db.execute(
@@ -911,7 +1127,7 @@ def authenticate(role: str, environ, start_response):
 
     db = get_auth_db()
     user = db.execute(
-        "SELECT user_id, login_id, role, password_hash, salt, patient_id, arzt_id, is_temp_password FROM user_login WHERE login_id = ? AND role = ? AND is_active = 1",
+        "SELECT user_id, login_id, role, password_hash, salt, patient_id, arzt_id, praxis_id, is_temp_password FROM user_login WHERE login_id = ? AND role = ? AND is_active = 1",
         (login_id, role),
     ).fetchone()
     db.close()
@@ -922,8 +1138,10 @@ def authenticate(role: str, environ, start_response):
 
     if role == "patient" and user["is_temp_password"]:
         return redirect(start_response, f"/patienten/erstlogin?login_id={login_id}")
+    if role == "praxis" and user["is_temp_password"]:
+        return redirect(start_response, f"/praxis/erstlogin?login_id={login_id}")
 
-    payload = {"role": role, "login_id": login_id, "patient_id": user["patient_id"], "arzt_id": user["arzt_id"]}
+    payload = {"role": role, "login_id": login_id, "patient_id": user["patient_id"], "arzt_id": user["arzt_id"], "praxis_id": user["praxis_id"]}
     return redirect(start_response, dashboard_for_role(role), headers=[("Set-Cookie", build_session_cookie(payload))])
 
 
@@ -932,6 +1150,8 @@ def dashboard_for_role(role: str) -> str:
         return "/admin"
     if role == "arzt":
         return "/arzt"
+    if role == "praxis":
+        return "/praxis"
     return "/patienten"
 
 
@@ -974,6 +1194,10 @@ def app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [role_login_page("admin", query.get("login_id", [""])[0])]
 
+    if path == "/praxis/login" and method == "GET":
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [role_login_page("praxis", query.get("login_id", [""])[0])]
+
     if path == "/patient/authenticate" and method == "POST":
         return authenticate("patient", environ, start_response)
 
@@ -982,6 +1206,9 @@ def app(environ, start_response):
 
     if path == "/admin/authenticate" and method == "POST":
         return authenticate("admin", environ, start_response)
+
+    if path == "/praxis/authenticate" and method == "POST":
+        return authenticate("praxis", environ, start_response)
 
     if path == "/patienten/erstlogin" and method == "GET":
         login_id = query.get("login_id", [""])[0]
@@ -1008,8 +1235,34 @@ def app(environ, start_response):
 
         if not user:
             return redirect(start_response, "/")
-        payload = {"role": "patient", "login_id": login_id, "patient_id": user["patient_id"], "arzt_id": None}
+        payload = {"role": "patient", "login_id": login_id, "patient_id": user["patient_id"], "arzt_id": None, "praxis_id": None}
         return redirect(start_response, "/patienten", headers=[("Set-Cookie", build_session_cookie(payload))])
+
+    if path == "/praxis/erstlogin" and method == "GET":
+        login_id = query.get("login_id", [""])[0]
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [praxis_first_login_page(login_id)]
+
+    if path == "/praxis/erstlogin" and method == "POST":
+        form_data = parse_post(environ)
+        login_id = get_val(form_data, "login_id")
+        new_password = get_val(form_data, "new_password")
+        if len(new_password) < 8:
+            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            return [praxis_first_login_page(login_id, "Passwort muss mindestens 8 Zeichen lang sein.")]
+        pw_hash, salt = password_hash(new_password)
+        db = get_auth_db()
+        user = db.execute("SELECT praxis_id FROM user_login WHERE login_id = ? AND role='praxis'", (login_id,)).fetchone()
+        db.execute(
+            "UPDATE user_login SET password_hash = ?, salt = ?, is_temp_password = 0 WHERE login_id = ? AND role = 'praxis'",
+            (pw_hash, salt, login_id),
+        )
+        db.commit()
+        db.close()
+        if not user:
+            return redirect(start_response, "/")
+        payload = {"role": "praxis", "login_id": login_id, "patient_id": None, "arzt_id": None, "praxis_id": user["praxis_id"]}
+        return redirect(start_response, "/praxis", headers=[("Set-Cookie", build_session_cookie(payload))])
 
     if path == "/logout" and method == "GET":
         return redirect(start_response, "/", headers=[("Set-Cookie", clear_session_cookie())])
@@ -1028,6 +1281,13 @@ def app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [arzt_dashboard(session)]
 
+    if path == "/praxis" and method == "GET":
+        denied = require_role(session, "praxis", start_response)
+        if denied:
+            return denied
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [praxis_dashboard(session)]
+
     if path == "/patienten" and method == "GET":
         denied = require_role(session, "patient", start_response)
         if denied:
@@ -1040,6 +1300,7 @@ def app(environ, start_response):
         "/arzt/behandlung/update": update_behandlung,
         "/arzt/medikament/update": update_medikament,
         "/arzt/rezept-medikament/update": update_rezept_medikament,
+        "/arzt/invite/accept": accept_praxis_invite,
     }
 
     if path in arzt_handlers and method == "POST":
@@ -1047,8 +1308,20 @@ def app(environ, start_response):
         if denied:
             return denied
         form_data = parse_post(environ)
-        arzt_handlers[path](form_data)
+        if path == "/arzt/invite/accept":
+            arzt_handlers[path](form_data, session)
+        else:
+            arzt_handlers[path](form_data)
         return redirect(start_response, "/arzt")
+
+
+    if path == "/praxis/invite" and method == "POST":
+        denied = require_role(session, "praxis", start_response)
+        if denied:
+            return denied
+        form_data = parse_post(environ)
+        invite_arzt_to_praxis(form_data, session)
+        return redirect(start_response, "/praxis")
 
     admin_handlers = {
         "/patient/new": create_patient,
@@ -1062,6 +1335,7 @@ def app(environ, start_response):
         "/mapping/behandlung-dokument": create_mapping_behandlung_dokument,
         "/mapping/praxis-patient": create_mapping_praxis_patient,
         "/mapping/behandlung-arzt": create_mapping_behandlung_arzt,
+        "/admin/reset-password": reset_user_password,
     }
 
     if path in admin_handlers and method == "POST":
