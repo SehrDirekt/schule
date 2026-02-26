@@ -1,1 +1,1 @@
-# Keine externen Abhängigkeiten nötig (nur Python-Standardbibliothek)
+ldap3>=2.9.1
