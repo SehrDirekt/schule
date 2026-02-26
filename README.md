@@ -8,16 +8,16 @@ Dieses Projekt bildet das ER-Diagramm als SQLite-Datenbank ab und liefert ein lo
 - Login-Frontpage unter `/` mit **einem Eingabefeld** (Login-ID)
 - Getrennte Login-Seiten je Rolle:
   - Patient: `/patienten/login`
-  - Praxis: `/praxis/login`
+  - Arzt: `/arzt/login`
   - Admin: `/admin/login`
 - Patienten-Erstanmeldung über `/patienten/erstlogin` mit Passwortwechsel
 - Admin-Oberfläche für:
   - Anlage und Verwaltung medizinischer Entitäten
   - Übersicht aller User-Logins
   - Einsicht in simulierte Mail-Outbox
-- Praxis-Oberfläche zur Einsicht/Verwaltung eigener Patienten
-- Separate Login-Datenbank `user_logins.db`, verknüpft über `patient_id` (paID) und `praxis_id`
-- Beim Anlegen von Patient/Praxis werden temporäre Logindaten erzeugt und als E-Mail in `mail_outbox` protokolliert
+- Arzt-Oberfläche mit Behandlungs-/Rezeptübersicht und Edit-Funktionen
+- Separate Login-Datenbank `user_logins.db`, verknüpft über `patient_id`, `arzt_id` und `mensch_id`
+- Beim Anlegen von Patient/Arzt werden temporäre Logindaten erzeugt und als E-Mail in `mail_outbox` protokolliert
 
 ## Start
 
