@@ -38,14 +38,3 @@ Demo-Admin-Login:
 
 - Login-ID: `admin`
 - Passwort: `Admin123!`
-
-
-## LDAP für Admin-Login
-
-Optional kann die Admin-Anmeldung per LDAP-Bind erfolgen (zusätzlich zur lokalen Passwort-Prüfung).
-
-Benötigte Variablen:
-
-- `LDAP_ENABLED=1`
-- `LDAP_SERVER_URI=ldap://<server>:389`
-- `LDAP_BIND_DN_TEMPLATE=uid={login_id},ou=people,dc=schule,dc=local`
