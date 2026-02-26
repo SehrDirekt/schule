@@ -85,3 +85,38 @@ pre { margin: 0; white-space: pre-wrap; }
 .summary-card h4 { margin: 0; color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
 .summary-card p { margin: .4rem 0 0; font-size: 1.6rem; font-weight: 700; }
 .quick-links { margin: .4rem 0 0; padding-left: 1rem; display: grid; gap: .35rem; }
+
+
+.action-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.action-panel summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 1rem 1.1rem;
+  font-weight: 700;
+  border-bottom: 1px solid transparent;
+}
+
+.action-panel summary::-webkit-details-marker { display: none; }
+
+.action-panel summary::after {
+  content: '▾';
+  float: right;
+  color: var(--muted);
+  transition: transform .2s ease;
+}
+
+.action-panel[open] summary {
+  border-bottom-color: var(--border);
+}
+
+.action-panel[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.action-content {
+  padding: 1rem 1.1rem 1.1rem;
+}
