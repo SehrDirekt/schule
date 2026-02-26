@@ -18,6 +18,7 @@ SCHEMA_PATH = BASE_DIR / "schema.sql"
 COOKIE_NAME = "app_session"
 APP_SECRET = os.environ.get("APP_SECRET", "schule-local-secret-change-me").encode("utf-8")
 SESSION_TTL_SECONDS = 60 * 60 * 8
+ADMIN_PRAXIS_CODE_TTL_SECONDS = 60 * 5
 
 
 def get_db() -> sqlite3.Connection:
@@ -77,6 +78,13 @@ def init_auth_db() -> None:
           note TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           accepted_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_praxis_access_code (
+          praxis_id INTEGER PRIMARY KEY,
+          access_code TEXT NOT NULL,
+          expires_at INTEGER NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -714,28 +722,60 @@ def praxis_dashboard(session: dict, override_praxis_id: int | None = None, reado
         "SELECT invitation_id, arzt_id, status, note, created_at FROM praxis_invitation WHERE praxis_id = ? ORDER BY invitation_id DESC",
         (praxis_id,),
     ).fetchall()
+    code_value, code_expires_at = get_or_refresh_admin_praxis_code(auth_db, int(praxis_id))
     auth_db.close()
 
     if not praxis:
         return base_layout("<section><p>Praxis nicht gefunden.</p></section>", title="Praxisbereich")
 
-    arzt_rows = "".join(
-        f"<tr><td>{a['arzt_id']}</td><td>{html.escape(a['vor_nachname'])}</td><td>{html.escape(a['fachrichtung'] or '-')}</td></tr>"
-        for a in aerzte
-    )
+    arzt_row_items = []
+    for a in aerzte:
+        remove_button = ""
+        if not readonly:
+            remove_button = (
+                "<form method='post' action='/praxis/member/remove' onsubmit=\"return confirm('Arzt aus Praxis entfernen?')\">"
+                f"<input type='hidden' name='arzt_id' value='{a['arzt_id']}'>"
+                f"<input type='hidden' name='praxis_id' value='{praxis_id}'>"
+                "<button type='submit'>Entfernen</button></form>"
+            )
+        arzt_row_items.append(
+            f"<tr><td>{a['arzt_id']}</td><td>{html.escape(a['vor_nachname'])}</td><td>{html.escape(a['fachrichtung'] or '-')}</td><td>{remove_button or '-'}</td></tr>"
+        )
+    arzt_rows = "".join(arzt_row_items)
     invite_rows = "".join(
         f"<tr><td>{i['invitation_id']}</td><td>{i['arzt_id']}</td><td>{html.escape(i['status'])}</td><td>{html.escape(i['note'] or '-')}</td><td>{i['created_at']}</td></tr>"
         for i in invites
     )
 
-    admin_back_link = " | <a href='/admin'>Zurück zum Admin Control Center</a>" if readonly else ""
+    admin_back_link = " | <a href='/admin'>Zurück zum Admin Control Center</a>" if session.get("role") == "admin" else ""
     readonly_hint = "<p class='subtitle'>Sie sehen das Praxis-Dashboard als Admin im Lesemodus.</p>" if readonly else ""
+    code_info_section = f"""
+<section>
+  <h3>Admin-Zugangscode</h3>
+  <p>Dieser Code wird alle 5 Minuten automatisch erneuert.</p>
+  <p><strong>Code:</strong> <code>{html.escape(code_value)}</code></p>
+  <p><small>Gültig bis Unix-Zeitstempel {code_expires_at}</small></p>
+</section>
+"""
+
+    manage_name_section = ""
     invite_section = ""
     if not readonly:
-        invite_section = """
+        manage_name_section = f"""
+<section>
+  <h3>Praxisname verwalten</h3>
+  <form method='post' action='/praxis/update-name' class='form-grid'>
+    <input type='hidden' name='praxis_id' value='{praxis_id}'>
+    <label>Neuer Praxisname <input name='name' value='{html.escape(praxis['name'], quote=True)}' required></label>
+    <button type='submit'>Praxisname speichern</button>
+  </form>
+</section>
+"""
+        invite_section = f"""
 <section>
   <h3>Arzt einladen</h3>
   <form method='post' action='/praxis/invite' class='form-grid'>
+    <input type='hidden' name='praxis_id' value='{praxis_id}'>
     <label>Arzt Login-ID (z.B. arzt-2) <input name='arzt_login_id' required></label>
     <label>Notiz <input name='note' placeholder='Optional'></label>
     <button type='submit'>Einladung senden</button>
@@ -751,9 +791,11 @@ def praxis_dashboard(session: dict, override_praxis_id: int | None = None, reado
   {readonly_hint}
 </section>
 {invite_section}
+{manage_name_section}
+{code_info_section}
 <section>
   <h3>Mitglieder</h3>
-  <table><thead><tr><th>Arzt-ID</th><th>Name</th><th>Fachrichtung</th></tr></thead><tbody>{arzt_rows}</tbody></table>
+  <table><thead><tr><th>Arzt-ID</th><th>Name</th><th>Fachrichtung</th><th>Aktion</th></tr></thead><tbody>{arzt_rows}</tbody></table>
 </section>
 <section>
   <h3>Gesendete Einladungen</h3>
@@ -1031,6 +1073,83 @@ def invite_arzt_to_praxis(form_data: dict[str, list[str]], session: dict) -> Non
     queue_mail(arzt_login_id, "Einladung in Praxis", f"Sie wurden in die Praxis {session.get('praxis_id')} eingeladen.")
 
 
+def update_praxis_name(form_data: dict[str, list[str]], praxis_id: int) -> None:
+    new_name = get_val(form_data, "name")
+    if not new_name:
+        return
+    db = get_db()
+    db.execute("UPDATE praxis SET name = ? WHERE praxis_id = ?", (new_name, praxis_id))
+    db.commit()
+    db.close()
+
+
+def remove_praxis_member(form_data: dict[str, list[str]], praxis_id: int) -> None:
+    arzt_id_raw = get_val(form_data, "arzt_id")
+    if not arzt_id_raw.isdigit():
+        return
+    db = get_db()
+    db.execute("DELETE FROM zo_praxis_arzt WHERE praxis_id = ? AND arzt_id = ?", (praxis_id, int(arzt_id_raw)))
+    db.commit()
+    db.close()
+
+
+def get_or_refresh_admin_praxis_code(auth_db: sqlite3.Connection, praxis_id: int) -> tuple[str, int]:
+    now_ts = int(time.time())
+    row = auth_db.execute(
+        "SELECT access_code, expires_at FROM admin_praxis_access_code WHERE praxis_id = ?",
+        (praxis_id,),
+    ).fetchone()
+    if row and int(row["expires_at"]) > now_ts:
+        return row["access_code"], int(row["expires_at"])
+
+    code_value = str(secrets.randbelow(900000) + 100000)
+    expires_at = now_ts + ADMIN_PRAXIS_CODE_TTL_SECONDS
+    auth_db.execute(
+        """
+        INSERT INTO admin_praxis_access_code (praxis_id, access_code, expires_at, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(praxis_id) DO UPDATE SET access_code = excluded.access_code, expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP
+        """,
+        (praxis_id, code_value, expires_at),
+    )
+    auth_db.commit()
+    return code_value, expires_at
+
+
+def is_admin_praxis_access_verified(session: dict | None, praxis_id: int) -> bool:
+    if not session or session.get("role") != "admin":
+        return False
+    verified_for = session.get("admin_praxis_verified_for")
+    verified_until = int(session.get("admin_praxis_verified_until", 0) or 0)
+    return int(verified_for or -1) == praxis_id and verified_until > int(time.time())
+
+
+def admin_praxis_access_page(praxis_id: int, error: str = "") -> bytes:
+    db = get_db()
+    praxis = db.execute("SELECT name FROM praxis WHERE praxis_id = ?", (praxis_id,)).fetchone()
+    db.close()
+    praxis_label = praxis["name"] if praxis else f"ID {praxis_id}"
+    error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
+    return base_layout(
+        f"""
+<section class='narrow'>
+  <h2>Praxiszugriff freischalten</h2>
+  <p>Für den Zugriff auf <strong>{html.escape(praxis_label)}</strong> muss der aktuelle Praxiscode eingegeben werden.</p>
+  {error_html}
+  <form method='post' action='/admin/praxis-dashboard/verify'>
+    <input type='hidden' name='praxis_id' value='{praxis_id}'>
+    <label>Praxiscode
+      <input name='access_code' required inputmode='numeric' pattern='[0-9]{{6}}' placeholder='6-stelliger Code'>
+    </label>
+    <button type='submit'>Zugriff freischalten</button>
+  </form>
+  <p><a href='/admin'>Zurück</a></p>
+</section>
+""",
+        title="Admin Praxisfreigabe",
+    )
+
+
 def accept_praxis_invite(form_data: dict[str, list[str]], session: dict) -> None:
     invitation_id = int(get_val(form_data, "invitation_id"))
     arzt_id = int(session.get("arzt_id"))
@@ -1293,8 +1412,38 @@ def app(environ, start_response):
         praxis_id_raw = query.get("praxis_id", [""])[0]
         if not praxis_id_raw.isdigit():
             return redirect(start_response, "/admin")
+        praxis_id = int(praxis_id_raw)
+        if not is_admin_praxis_access_verified(session, praxis_id):
+            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            return [admin_praxis_access_page(praxis_id)]
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
-        return [praxis_dashboard(session, override_praxis_id=int(praxis_id_raw), readonly=True)]
+        return [praxis_dashboard(session, override_praxis_id=praxis_id, readonly=False)]
+
+    if path == "/admin/praxis-dashboard/verify" and method == "POST":
+        denied = require_role(session, "admin", start_response)
+        if denied:
+            return denied
+        form_data = parse_post(environ)
+        praxis_id_raw = get_val(form_data, "praxis_id")
+        access_code = get_val(form_data, "access_code")
+        if not praxis_id_raw.isdigit():
+            return redirect(start_response, "/admin")
+        praxis_id = int(praxis_id_raw)
+        auth_db = get_auth_db()
+        expected_code, expires_at = get_or_refresh_admin_praxis_code(auth_db, praxis_id)
+        auth_db.close()
+        if access_code != expected_code:
+            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            return [admin_praxis_access_page(praxis_id, "Code ungültig oder bereits abgelaufen.")]
+        verified_payload = session | {
+            "admin_praxis_verified_for": praxis_id,
+            "admin_praxis_verified_until": expires_at,
+        }
+        return redirect(
+            start_response,
+            f"/admin/praxis-dashboard?praxis_id={praxis_id}",
+            headers=[("Set-Cookie", build_session_cookie(verified_payload))],
+        )
 
     if path == "/arzt" and method == "GET":
         denied = require_role(session, "arzt", start_response)
@@ -1337,13 +1486,35 @@ def app(environ, start_response):
         return redirect(start_response, "/arzt")
 
 
-    if path == "/praxis/invite" and method == "POST":
-        denied = require_role(session, "praxis", start_response)
-        if denied:
-            return denied
+    if path in {"/praxis/invite", "/praxis/update-name", "/praxis/member/remove"} and method == "POST":
+        if not session:
+            return redirect(start_response, "/")
+
         form_data = parse_post(environ)
-        invite_arzt_to_praxis(form_data, session)
-        return redirect(start_response, "/praxis")
+        praxis_id_raw = get_val(form_data, "praxis_id")
+
+        if session.get("role") == "praxis":
+            praxis_id = int(session.get("praxis_id"))
+            redirect_target = "/praxis"
+            scoped_session = session
+        elif session.get("role") == "admin":
+            if not praxis_id_raw.isdigit():
+                return redirect(start_response, "/admin")
+            praxis_id = int(praxis_id_raw)
+            if not is_admin_praxis_access_verified(session, praxis_id):
+                return redirect(start_response, "/admin")
+            redirect_target = f"/admin/praxis-dashboard?praxis_id={praxis_id}"
+            scoped_session = session | {"praxis_id": praxis_id}
+        else:
+            return redirect(start_response, "/")
+
+        if path == "/praxis/invite":
+            invite_arzt_to_praxis(form_data, scoped_session)
+        elif path == "/praxis/update-name":
+            update_praxis_name(form_data, praxis_id)
+        else:
+            remove_praxis_member(form_data, praxis_id)
+        return redirect(start_response, redirect_target)
 
     admin_handlers = {
         "/patient/new": create_patient,
