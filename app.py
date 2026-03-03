@@ -49,7 +49,7 @@ def init_auth_db() -> None:
         CREATE TABLE IF NOT EXISTS user_login (
           user_id INTEGER PRIMARY KEY AUTOINCREMENT,
           login_id TEXT NOT NULL UNIQUE,
-          role TEXT NOT NULL CHECK(role IN ('admin', 'arzt', 'patient', 'praxis')),
+          role TEXT NOT NULL CHECK(role IN ('leitung', 'admin', 'arzt', 'patient', 'praxis')),
           password_hash TEXT NOT NULL,
           salt TEXT NOT NULL,
           is_temp_password INTEGER NOT NULL DEFAULT 1,
@@ -86,8 +86,42 @@ def init_auth_db() -> None:
           expires_at INTEGER NOT NULL,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
         """
     )
+
+    user_login_ddl = db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'user_login'").fetchone()
+    if user_login_ddl and "'leitung'" not in (user_login_ddl["sql"] or ""):
+        db.executescript(
+            """
+            CREATE TABLE user_login_new (
+              user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              login_id TEXT NOT NULL UNIQUE,
+              role TEXT NOT NULL CHECK(role IN ('leitung', 'admin', 'arzt', 'patient', 'praxis')),
+              password_hash TEXT NOT NULL,
+              salt TEXT NOT NULL,
+              is_temp_password INTEGER NOT NULL DEFAULT 1,
+              patient_id INTEGER,
+              arzt_id INTEGER,
+              praxis_id INTEGER,
+              mensch_id INTEGER,
+              is_active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            INSERT INTO user_login_new (
+              user_id, login_id, role, password_hash, salt, is_temp_password,
+              patient_id, arzt_id, praxis_id, mensch_id, is_active, created_at
+            )
+            SELECT
+              user_id, login_id, role, password_hash, salt, is_temp_password,
+              patient_id, arzt_id, praxis_id, mensch_id, is_active, created_at
+            FROM user_login;
+
+            DROP TABLE user_login;
+            ALTER TABLE user_login_new RENAME TO user_login;
+            """
+        )
 
     columns = [row[1] for row in db.execute("PRAGMA table_info(user_login)").fetchall()]
     if "arzt_id" not in columns:
@@ -100,9 +134,12 @@ def init_auth_db() -> None:
         db.execute("UPDATE user_login SET arzt_id = praxis_id WHERE arzt_id IS NULL")
 
     db.execute("UPDATE user_login SET user_id = -1 WHERE role = 'admin' AND user_id != -1 AND NOT EXISTS (SELECT 1 FROM user_login WHERE user_id = -1)")
-    admin_exists = db.execute("SELECT 1 FROM user_login WHERE role = 'admin' LIMIT 1").fetchone()
-    if not admin_exists:
-        create_login_user(db, login_id="admin", role="admin", raw_password="Admin123!", is_temp=False, user_id=-1)
+    admin_login_exists = db.execute("SELECT 1 FROM user_login WHERE login_id = 'team-admin' LIMIT 1").fetchone()
+    if not admin_login_exists:
+        create_login_user(db, login_id="team-admin", role="admin", raw_password="Admin123!", is_temp=False)
+    leitung_exists = db.execute("SELECT 1 FROM user_login WHERE role = 'leitung' LIMIT 1").fetchone()
+    if not leitung_exists:
+        create_login_user(db, login_id="team-leitung", role="leitung", raw_password="Leitung123!", is_temp=False)
     db.commit()
     db.close()
 
@@ -286,7 +323,7 @@ def login_frontpage(error: str = "") -> bytes:
   {error_html}
   <form method='post' action='/login/start'>
     <label>Login-ID
-      <input name='login_id' required placeholder='z. B. admin oder pa-12'>
+      <input name='login_id' required placeholder='z. B. team-admin, team-leitung oder pa-12'>
     </label>
     <button type='submit'>Weiter</button>
   </form>
@@ -298,7 +335,7 @@ def login_frontpage(error: str = "") -> bytes:
 
 
 def role_login_page(role: str, login_id: str, error: str = "") -> bytes:
-    roles = {"patient": "Patient", "arzt": "Arzt", "admin": "Admin", "praxis": "Praxis"}
+    roles = {"patient": "Patient", "arzt": "Arzt", "admin": "Admin", "praxis": "Praxis", "leitung": "Team/Leitung"}
     error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
     return base_layout(
         f"""
@@ -364,6 +401,36 @@ def praxis_first_login_page(login_id: str, error: str = "") -> bytes:
         title="Praxis Erstanmeldung",
     )
 
+
+def format_user_identifier(row: sqlite3.Row) -> str:
+    role = row["role"]
+    if role == "praxis" and row["praxis_id"]:
+        return f"PX-{row['praxis_id']}"
+    if role == "arzt" and row["arzt_id"]:
+        return f"AR-{row['arzt_id']}"
+    if role == "patient" and row["patient_id"]:
+        return f"PA-{row['patient_id']}"
+    return f"TM-{abs(int(row['user_id']))}"
+
+
+def leitung_dashboard() -> bytes:
+    return base_layout(
+        """
+<section>
+  <h2>Leitung Dashboard</h2>
+  <p><a href='/logout'>Abmelden</a></p>
+  <div class='cards'>
+    <article class='action-panel'>
+      <h3>Administration öffnen</h3>
+      <p>Als Leitung haben Sie Zugriff auf das komplette Admin Control Center.</p>
+      <p><a href='/admin'>Zum Admin Control Center</a></p>
+    </article>
+  </div>
+</section>
+""",
+        title="Leitung Dashboard",
+    )
+
 def admin_dashboard() -> bytes:
     auth_db = get_auth_db()
     users = auth_db.execute(
@@ -425,7 +492,7 @@ def admin_dashboard() -> bytes:
                 "<button type='submit'>Löschen</button></form>"
             )
         user_row_list.append(
-            f"<tr><td>{u['user_id']}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['praxis_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td><td>{actions}</td></tr>"
+            f"<tr><td>{format_user_identifier(u)}</td><td>{html.escape(u['login_id'])}</td><td>{u['role']}</td><td>{u['patient_id'] or '-'}</td><td>{u['arzt_id'] or '-'}</td><td>{u['praxis_id'] or '-'}</td><td>{u['mensch_id'] or '-'}</td><td>{'Ja' if u['is_temp_password'] else 'Nein'}</td><td>{'Aktiv' if u['is_active'] else 'Inaktiv'}</td><td>{u['created_at']}</td><td>{actions}</td></tr>"
         )
     user_rows = "".join(user_row_list)
     mail_rows = "".join(
@@ -749,7 +816,9 @@ def praxis_dashboard(session: dict, override_praxis_id: int | None = None, reado
 
     admin_back_link = " | <a href='/admin'>Zurück zum Admin Control Center</a>" if session.get("role") == "admin" else ""
     readonly_hint = "<p class='subtitle'>Sie sehen das Praxis-Dashboard als Admin im Lesemodus.</p>" if readonly else ""
-    code_info_section = f"""
+    code_info_section = ""
+    if session.get("role") == "praxis":
+        code_info_section = f"""
 <section>
   <h3>Admin-Zugangscode</h3>
   <p>Dieser Code wird alle 5 Minuten automatisch erneuert.</p>
@@ -757,7 +826,6 @@ def praxis_dashboard(session: dict, override_praxis_id: int | None = None, reado
   <p><small>Gültig bis Unix-Zeitstempel {code_expires_at}</small></p>
 </section>
 """
-
     manage_name_section = ""
     invite_section = ""
     if not readonly:
@@ -1117,11 +1185,19 @@ def get_or_refresh_admin_praxis_code(auth_db: sqlite3.Connection, praxis_id: int
 
 
 def is_admin_praxis_access_verified(session: dict | None, praxis_id: int) -> bool:
-    if not session or session.get("role") != "admin":
+    if not session or session.get("role") not in {"admin", "leitung"}:
         return False
     verified_for = session.get("admin_praxis_verified_for")
     verified_until = int(session.get("admin_praxis_verified_until", 0) or 0)
     return int(verified_for or -1) == praxis_id and verified_until > int(time.time())
+
+
+def is_admin_praxis_access_expired(session: dict | None, praxis_id: int) -> bool:
+    if not session or session.get("role") not in {"admin", "leitung"}:
+        return False
+    verified_for = session.get("admin_praxis_verified_for")
+    verified_until = int(session.get("admin_praxis_verified_until", 0) or 0)
+    return int(verified_for or -1) == praxis_id and verified_until <= int(time.time())
 
 
 def admin_praxis_access_page(praxis_id: int, error: str = "") -> bytes:
@@ -1246,6 +1322,8 @@ def route_login_start(environ, start_response):
         return redirect(start_response, f"/arzt/login?login_id={login_id}")
     if user["role"] == "praxis":
         return redirect(start_response, f"/praxis/login?login_id={login_id}")
+    if user["role"] == "leitung":
+        return redirect(start_response, f"/leitung/login?login_id={login_id}")
     return redirect(start_response, f"/admin/login?login_id={login_id}")
 
 
@@ -1277,6 +1355,8 @@ def authenticate(role: str, environ, start_response):
 
 
 def dashboard_for_role(role: str) -> str:
+    if role == "leitung":
+        return "/leitung"
     if role == "admin":
         return "/admin"
     if role == "arzt":
@@ -1288,6 +1368,12 @@ def dashboard_for_role(role: str) -> str:
 
 def require_role(session: dict | None, role: str, start_response):
     if not session or session.get("role") != role:
+        return redirect(start_response, "/")
+    return None
+
+
+def require_roles(session: dict | None, roles: set[str], start_response):
+    if not session or session.get("role") not in roles:
         return redirect(start_response, "/")
     return None
 
@@ -1325,6 +1411,10 @@ def app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [role_login_page("admin", query.get("login_id", [""])[0])]
 
+    if path == "/leitung/login" and method == "GET":
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [role_login_page("leitung", query.get("login_id", [""])[0])]
+
     if path == "/praxis/login" and method == "GET":
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [role_login_page("praxis", query.get("login_id", [""])[0])]
@@ -1337,6 +1427,9 @@ def app(environ, start_response):
 
     if path == "/admin/authenticate" and method == "POST":
         return authenticate("admin", environ, start_response)
+
+    if path == "/leitung/authenticate" and method == "POST":
+        return authenticate("leitung", environ, start_response)
 
     if path == "/praxis/authenticate" and method == "POST":
         return authenticate("praxis", environ, start_response)
@@ -1399,20 +1492,30 @@ def app(environ, start_response):
         return redirect(start_response, "/", headers=[("Set-Cookie", clear_session_cookie())])
 
     if path == "/admin" and method == "GET":
-        denied = require_role(session, "admin", start_response)
+        denied = require_roles(session, {"admin", "leitung"}, start_response)
         if denied:
             return denied
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [admin_dashboard()]
 
+    if path == "/leitung" and method == "GET":
+        denied = require_role(session, "leitung", start_response)
+        if denied:
+            return denied
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [leitung_dashboard()]
+
     if path == "/admin/praxis-dashboard" and method == "GET":
-        denied = require_role(session, "admin", start_response)
+        denied = require_roles(session, {"admin", "leitung"}, start_response)
         if denied:
             return denied
         praxis_id_raw = query.get("praxis_id", [""])[0]
         if not praxis_id_raw.isdigit():
             return redirect(start_response, "/admin")
         praxis_id = int(praxis_id_raw)
+        if is_admin_praxis_access_expired(session, praxis_id):
+            refreshed = session | {"admin_praxis_verified_for": None, "admin_praxis_verified_until": 0}
+            return redirect(start_response, "/admin", headers=[("Set-Cookie", build_session_cookie(refreshed))])
         if not is_admin_praxis_access_verified(session, praxis_id):
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
             return [admin_praxis_access_page(praxis_id)]
@@ -1420,7 +1523,7 @@ def app(environ, start_response):
         return [praxis_dashboard(session, override_praxis_id=praxis_id, readonly=False)]
 
     if path == "/admin/praxis-dashboard/verify" and method == "POST":
-        denied = require_role(session, "admin", start_response)
+        denied = require_roles(session, {"admin", "leitung"}, start_response)
         if denied:
             return denied
         form_data = parse_post(environ)
@@ -1497,12 +1600,13 @@ def app(environ, start_response):
             praxis_id = int(session.get("praxis_id"))
             redirect_target = "/praxis"
             scoped_session = session
-        elif session.get("role") == "admin":
+        elif session.get("role") in {"admin", "leitung"}:
             if not praxis_id_raw.isdigit():
                 return redirect(start_response, "/admin")
             praxis_id = int(praxis_id_raw)
             if not is_admin_praxis_access_verified(session, praxis_id):
-                return redirect(start_response, "/admin")
+                refreshed = session | {"admin_praxis_verified_for": None, "admin_praxis_verified_until": 0}
+                return redirect(start_response, "/admin", headers=[("Set-Cookie", build_session_cookie(refreshed))])
             redirect_target = f"/admin/praxis-dashboard?praxis_id={praxis_id}"
             scoped_session = session | {"praxis_id": praxis_id}
         else:
@@ -1534,7 +1638,7 @@ def app(environ, start_response):
     }
 
     if path in admin_handlers and method == "POST":
-        denied = require_role(session, "admin", start_response)
+        denied = require_roles(session, {"admin", "leitung"}, start_response)
         if denied:
             return denied
         form_data = parse_post(environ)
